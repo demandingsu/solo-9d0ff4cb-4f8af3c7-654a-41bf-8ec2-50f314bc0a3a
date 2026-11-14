@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query
@@ -45,6 +46,10 @@ class _State:
         # Gives a deterministic, race-free cursor-expiry demo.
         self.expire_after_requests = 0
         self.changes_calls = 0
+        # Artificial per-page latency for /changes, in seconds, so the demo can
+        # show that collector status/paper queries stay responsive while a slow
+        # page is being fetched. 0 disables the delay.
+        self.page_delay_seconds = 0.0
 
 
 STATE = _State()
@@ -137,6 +142,16 @@ class ExpireAfterRequest(BaseModel):
     requests: int = Field(ge=0, description="invalidate cursors after this many /changes calls; 0 disables")
 
 
+class PageDelayRequest(BaseModel):
+    seconds: float = Field(
+        ge=0, le=8,
+        description=(
+            "artificial latency per /changes page; 0 disables. Kept below the "
+            "collector's 10s HTTP timeout so a slow page is not a timeout"
+        ),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Core change feed
 # --------------------------------------------------------------------------- #
@@ -157,6 +172,14 @@ def get_changes(
         if STATE.fail_next > 0:
             STATE.fail_next -= 1
             raise HTTPException(status_code=503, detail="injected transient source failure")
+        page_delay = STATE.page_delay_seconds
+
+    # Slow-response injection: sleep WITHOUT holding the state lock, so the
+    # source's own control endpoints (and any other request) stay responsive
+    # while a page is "slow to produce". The collector intentionally does its
+    # fetch on a worker thread, so its status/paper endpoints are unaffected.
+    if page_delay > 0:
+        time.sleep(page_delay)
 
     if start > end:
         raise HTTPException(status_code=400, detail="start must be <= end (ISO-8601 UTC)")
@@ -229,6 +252,14 @@ def control_expire_after(req: ExpireAfterRequest) -> dict:
         }
 
 
+@app.post("/control/page-delay")
+def control_page_delay(req: PageDelayRequest) -> dict:
+    """Add artificial latency to every /changes page (0 disables)."""
+    with _lock:
+        STATE.page_delay_seconds = req.seconds
+        return {"page_delay_seconds": STATE.page_delay_seconds}
+
+
 @app.post("/control/expire-cursors")
 def control_expire_cursors() -> dict:
     with _lock:
@@ -265,6 +296,7 @@ def control_reset() -> dict:
         STATE.cursor_generation = 0
         STATE.expire_after_requests = 0
         STATE.changes_calls = 0
+        STATE.page_delay_seconds = 0.0
         total = len(_events_locked())
     return {"status": "reset", "total_events": total}
 
@@ -279,6 +311,7 @@ def control_state() -> dict:
             "cursor_generation": STATE.cursor_generation,
             "expire_after_requests": STATE.expire_after_requests,
             "changes_calls": STATE.changes_calls,
+            "page_delay_seconds": STATE.page_delay_seconds,
             "cursor_ttl_seconds": CURSOR_TTL_SECONDS,
         }
 

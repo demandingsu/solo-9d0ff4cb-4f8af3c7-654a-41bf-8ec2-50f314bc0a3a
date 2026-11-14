@@ -8,6 +8,8 @@ import json
 import os
 import tempfile
 import threading
+import time
+import uuid
 
 import httpx
 import pytest
@@ -35,6 +37,9 @@ class FakeSource:
         self.fail_next = 0
         self.generation = 0
         self.calls = 0
+        self.page_delay = 0.0
+        self.page_gate: threading.Event | None = None
+        self.page_entered = threading.Event()
         self._lock = threading.Lock()
 
     def add(self, paper_id, rev, retracted, changed_at, title=None, authors=None):
@@ -64,6 +69,15 @@ class FakeSource:
             if self.fail_next > 0:
                 self.fail_next -= 1
                 return httpx.Response(503, json={"detail": "injected failure"})
+            delay = self.page_delay
+
+        # Slow page: block the FETCHING THREAD only (never the test thread),
+        # so the API remains free to answer status queries meanwhile.
+        self.page_entered.set()
+        if self.page_gate is not None:
+            self.page_gate.wait(timeout=10)
+        if delay:
+            time.sleep(delay)
 
         params = request.url.params
         start, end = params["start"], params["end"]
@@ -107,13 +121,21 @@ def client(source, monkeypatch):
 
     monkeypatch.setattr(httpx, "Client", patched_client)
     # Fresh DB per test.
-    db_path = os.path.join(_TMP.name, f"test_{id(source)}.db")
+    db_path = os.path.join(_TMP.name, f"test_{uuid.uuid4().hex}.db")
     monkeypatch.setattr("collector.app.main.DB_PATH", db_path)
 
     # Do not spawn API-level background threads; tests drive the real worker
-    # synchronously via sync.run_sync (same code path).
+    # synchronously via sync.run_sync (same code path). The handler claims the
+    # process slot before calling start_background, so the fake must consume
+    # that claim (otherwise the synchronous run below could not acquire it).
+    def fake_start_background(job_id, _db_path=None, *, allowed_statuses=(), claim_held=False):
+        if not claim_held:
+            sync.try_claim()
+        sync.release_claim()
+        return True
+
     monkeypatch.setattr(
-        "collector.app.main.sync.start_background", lambda *a, **k: True
+        "collector.app.main.sync.start_background", fake_start_background
     )
     db.init_db(db_path)
     with TestClient(app) as c:
@@ -131,8 +153,29 @@ def _run(client, job_id, db_path):
     sync.run_sync(job_id, db_path)
 
 
+# Captured before the fixture replaces it with a no-thread stub; tests that
+# need the genuine claim->thread handoff use this.
+_REAL_START_BACKGROUND = sync.start_background
+
+
 def _job(client, job_id):
     return client.get(f"/sync/jobs/{job_id}").json()
+
+
+def _wait_for_worker(job_id, timeout=10.0):
+    """Wait until the background worker for ``job_id`` has finished."""
+    name = f"sync-job-{job_id}"
+    for thread in threading.enumerate():
+        if thread.name == name:
+            thread.join(timeout=timeout)
+            assert not thread.is_alive(), "worker thread did not finish"
+            return
+    raise AssertionError(f"worker thread {name} was never started")
+
+
+def _hold_slot():
+    """Simulate a worker currently owning the process-wide execution slot."""
+    assert sync.try_claim()
 
 
 # --------------------------------------------------------------------------- #
@@ -295,19 +338,191 @@ def test_restart_marks_job_interrupted_and_resumes(client, source, monkeypatch):
     assert sorted(p["paper_id"] for p in client.get("/papers").json()) == ["P1", "P2"]
 
 
-def test_background_endpoint_runs_full_flow(client, source):
+def test_background_endpoint_runs_full_flow(client, source, monkeypatch):
+    # Use the genuine claim -> thread handoff (the fixture stubs it out).
+    monkeypatch.setattr(sync, "start_background", _REAL_START_BACKGROUND)
     source.add("P1", 1, False, "2026-11-01T08:00:00Z")
     resp = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"})
     assert resp.status_code == 201
     job_id = resp.json()["id"]
 
-    # Exercise the real worker on a background thread (the exact production
-    # path): the patched httpx.Client still routes it to the fake source.
-    thread = threading.Thread(
-        target=sync.run_sync, args=(job_id, client.db_path), name="test-worker"
-    )
-    thread.start()
-    thread.join(timeout=10)
-    assert not thread.is_alive()
+    _wait_for_worker(job_id)
     assert _job(client, job_id)["status"] == "completed"
     assert client.get("/papers/P1").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency / handoff regressions
+# --------------------------------------------------------------------------- #
+def test_rejected_create_does_not_leave_orphan_collecting_job(client, source):
+    """A 409 while another job owns the slot must not add any job row."""
+    # A job exists and a worker is advancing it right now.
+    job = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"}).json()
+    _hold_slot()  # the worker holds the process-wide slot
+    try:
+        before = client.get("/sync/jobs").json()
+        resp = client.post("/sync/jobs", json={"end": "2026-11-09T00:00:00Z"})
+        assert resp.status_code == 409
+        after = client.get("/sync/jobs").json()
+        assert after == before, "rejected request created an orphan job"
+        assert [j["id"] for j in after] == [job["id"]]
+        assert after[0]["status"] == "collecting"
+    finally:
+        sync.release_claim()
+
+    # The blocked job is still the only one and is still runnable.
+    _run(client, job["id"], client.db_path)
+    assert _job(client, job["id"])["status"] == "completed"
+    # Slot free again: the very next create is accepted.
+    resp = client.post("/sync/jobs", json={"end": "2026-11-09T00:00:00Z"})
+    assert resp.status_code == 201
+
+
+def test_validation_errors_release_the_claim(client, source):
+    """A rejected payload must not leave the execution slot occupied."""
+    assert client.post(
+        "/sync/jobs", json={"end": "not-a-timestamp"}
+    ).status_code == 422
+    assert client.post(
+        "/sync/jobs", json={"start": "2026-11-09T00:00:00Z",
+                            "end": "2026-11-05T00:00:00Z"}
+    ).status_code == 422
+    assert not sync._running.locked(), "a 422 leaked the execution slot"
+
+    resp = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"})
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "collecting"
+
+
+def test_rejected_create_cannot_touch_existing_progress(client, source, monkeypatch):
+    monkeypatch.setattr(sync, "start_background", _REAL_START_BACKGROUND)
+    source.add("P1", 1, False, "2026-11-01T08:00:00Z")
+    source.add("P2", 1, False, "2026-11-02T08:00:00Z")
+    # Make the first page slow so the job is genuinely in flight.
+    source.page_gate = threading.Event()
+
+    first = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"})
+    assert first.status_code == 201
+    job_id = first.json()["id"]
+    assert source.page_entered.wait(timeout=10), "worker never started fetching"
+
+    in_flight = _job(client, job_id)
+    assert in_flight["status"] == "collecting"
+
+    # A competing create is rejected and leaves the running job untouched.
+    conflict = client.post("/sync/jobs", json={"end": "2026-11-09T00:00:00Z"})
+    assert conflict.status_code == 409
+    assert _job(client, job_id) == in_flight
+    assert len(client.get("/sync/jobs").json()) == 1
+
+    source.page_gate.set()
+    _wait_for_worker(job_id)
+    done = _job(client, job_id)
+    assert done["status"] == "completed"
+    assert sorted(p["paper_id"] for p in client.get("/papers").json()) == ["P1", "P2"]
+
+
+def test_rejected_resume_does_not_touch_job(client, source):
+    source.add("P1", 1, False, "2026-11-01T08:00:00Z")
+    job = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"}).json()
+    source.fail_next = 1
+    _run(client, job["id"], client.db_path)
+    failed = _job(client, job["id"])
+    assert failed["status"] == "failed"
+
+    _hold_slot()
+    try:
+        resp = client.post(f"/sync/jobs/{job['id']}/resume")
+        assert resp.status_code == 409
+        assert _job(client, job["id"]) == failed
+    finally:
+        sync.release_claim()
+
+    # Once the slot is free, resume works normally.
+    assert client.post(f"/sync/jobs/{job['id']}/resume").status_code == 200
+    _run(client, job["id"], client.db_path)
+    assert _job(client, job["id"])["status"] == "completed"
+
+
+def test_start_background_refuses_non_runnable_job_without_leaking_slot(
+    client, source,
+):
+    source.add("P1", 1, False, "2026-11-01T08:00:00Z")
+    job = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"}).json()
+    _run(client, job["id"], client.db_path)
+    assert _job(client, job["id"])["status"] == "completed"
+
+    # No worker may be spawned for a completed job (e.g. a resume whose status
+    # was observed as failed a moment before the worker finished).
+    assert _REAL_START_BACKGROUND(job["id"], client.db_path) is False
+    assert not sync._running.locked(), "refused handoff leaked the execution slot"
+    assert _job(client, job["id"])["status"] == "completed"
+
+
+def test_worker_exit_always_releases_slot_and_marks_failure(
+    client, source, monkeypatch,
+):
+    """An unexpected error must not leave an occupied slot or a stuck job."""
+    source.add("P1", 1, False, "2026-11-01T08:00:00Z")
+
+    original_list_staged = db.list_staged
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(sync.db, "list_staged", boom)
+    job = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"}).json()
+    _run(client, job["id"], client.db_path)
+
+    failed = _job(client, job["id"])
+    assert failed["status"] == "failed"
+    assert "disk on fire" in (failed["error"] or "")
+    assert not sync._running.locked()
+    # The failed job is resumable once the cause is gone.
+    monkeypatch.setattr(sync.db, "list_staged", original_list_staged)
+    client.post(f"/sync/jobs/{job['id']}/resume")
+    _run(client, job["id"], client.db_path)
+    assert _job(client, job["id"])["status"] == "completed"
+
+
+def test_slow_page_keeps_status_and_paper_queries_responsive(
+    client, source, monkeypatch,
+):
+    monkeypatch.setattr(sync, "start_background", _REAL_START_BACKGROUND)
+    source.add("P1", 1, False, "2026-11-01T08:00:00Z")
+    source.add("P2", 1, False, "2026-11-02T08:00:00Z")
+    source.page_gate = threading.Event()
+
+    job = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"}).json()
+    assert source.page_entered.wait(timeout=10)
+
+    # The worker is blocked fetching a slow page; queries must still answer.
+    started = time.monotonic()
+    assert _job(client, job["id"])["status"] == "collecting"
+    assert client.get("/papers").json() == []
+    assert time.monotonic() - started < 2.0
+
+    source.page_gate.set()
+    _wait_for_worker(job["id"])
+    assert _job(client, job["id"])["status"] == "completed"
+
+
+def test_accepted_job_survives_worker_completion_and_next_submit(client, source,
+                                                               monkeypatch):
+    """Completion and a new submission interleaving must not lose execution."""
+    monkeypatch.setattr(sync, "start_background", _REAL_START_BACKGROUND)
+    source.add("P1", 1, False, "2026-11-01T08:00:00Z")
+    first = client.post("/sync/jobs", json={"end": "2026-11-05T00:00:00Z"}).json()
+    _wait_for_worker(first["id"])
+    assert _job(client, first["id"])["status"] == "completed"
+
+    # Immediately submit the next incremental job; the previous worker has
+    # exited and released its claim, so it must be accepted and executed.
+    source.add("P2", 1, False, "2026-11-06T08:00:00Z")
+    second = client.post("/sync/jobs", json={"end": "2026-11-10T00:00:00Z"})
+    assert second.status_code == 201
+    _wait_for_worker(second.json()["id"])
+    assert _job(client, second.json()["id"])["status"] == "completed"
+    assert sorted(p["paper_id"] for p in client.get("/papers").json()) == [
+        "P1", "P2"
+    ]

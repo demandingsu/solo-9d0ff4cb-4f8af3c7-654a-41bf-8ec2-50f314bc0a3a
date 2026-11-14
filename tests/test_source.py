@@ -6,6 +6,7 @@ lock-acquiring helper while already holding the global state lock.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -145,3 +146,46 @@ def test_expire_after_hook_invalidates_next_cursor(client):
     # A request without a cursor still works (re-fetch from offset 0 allowed).
     r3 = client.get("/changes", params=params)
     assert r3.status_code == 200 and r3.json()["page"] == 1
+
+
+def test_page_delay_slows_changes_without_blocking_control_and_health(client):
+    client.post("/control/reset")
+    client.post("/control/page-delay", json={"seconds": 1.0})
+    try:
+        assert client.get("/control/state").json()["page_delay_seconds"] == 1.0
+
+        slow_result: dict = {}
+
+        def fetch_slow_page():
+            started = time.monotonic()
+            r = client.get("/changes", params={
+                "start": "1970-01-01T00:00:00Z", "end": "2026-12-31T23:59:59Z",
+            })
+            slow_result["elapsed"] = time.monotonic() - started
+            slow_result["status"] = r.status_code
+
+        t = threading.Thread(target=fetch_slow_page, daemon=True)
+        t.start()
+        # Give the slow request time to enter its sleep.
+        time.sleep(0.2)
+
+        # While /changes is sleeping, health/control must answer promptly: the
+        # delay is applied outside the state lock.
+        started = time.monotonic()
+        assert client.get("/health").status_code == 200
+        assert client.get("/control/state").status_code == 200
+        assert time.monotonic() - started < 0.8
+
+        t.join(timeout=10)
+        assert not t.is_alive()
+        assert slow_result["status"] == 200
+        assert slow_result["elapsed"] >= 1.0
+    finally:
+        client.post("/control/page-delay", json={"seconds": 0})
+    assert client.get("/control/state").json()["page_delay_seconds"] == 0
+
+
+def test_reset_clears_page_delay(client):
+    client.post("/control/page-delay", json={"seconds": 2})
+    client.post("/control/reset")
+    assert client.get("/control/state").json()["page_delay_seconds"] == 0

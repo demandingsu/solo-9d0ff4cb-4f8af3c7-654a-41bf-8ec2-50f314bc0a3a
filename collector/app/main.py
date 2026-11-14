@@ -66,18 +66,58 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+def _mark_unstarted_failed(job_id: int, reason: str) -> None:
+    """Turn a committed-but-unexecuted job into an explicitly resumable one.
+
+    Only ever called for a job this request created, i.e. while still holding
+    the execution claim. Uses a short-lived connection so a failure here can
+    never be confused with the request's own transaction.
+    """
+    conn = _conn()
+    try:
+        with db.transaction(conn) as tx:
+            db.mark_status(tx, job_id, "failed", reason)
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- #
 # sync jobs
 # --------------------------------------------------------------------------- #
 @app.post("/sync/jobs", status_code=201, response_model=JobResponse)
 def create_job(req: CreateJobRequest) -> JobResponse:
-    end = sync._normalize_iso(req.end)
+    try:
+        end = sync._normalize_iso(req.end)
+        start_override = (
+            sync._normalize_iso(req.start) if req.start is not None else None
+        )
+    except sync.SyncError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     source_url = (req.source_url or DEFAULT_SOURCE_URL).rstrip("/")
     if not source_url.startswith(("http://", "https://")):
         raise HTTPException(status_code=422, detail="source_url must be http(s) URL")
 
-    conn = _conn()
+    # Claim the single execution slot BEFORE touching the database. A request
+    # that loses the concurrency race gets 409 without creating a job row or
+    # modifying any checkpoint — no orphaned 'collecting' task can be left
+    # behind for a later resume/retry to trip over.
+    if not sync.try_claim():
+        raise HTTPException(
+            status_code=409,
+            detail="another synchronization is in progress in this API process; "
+                   "retry after it finishes",
+        )
+
+    # Once start_background is called it always consumes the claim (either
+    # handing it to the worker or releasing it); every earlier exit path must
+    # release it here. If the job row was already committed but no worker took
+    # it, it is flipped to 'failed' (resumable) — never left in 'collecting'.
+    job_id: int | None = None
+    started = False
+    start_attempted = False
+    conn = None
     try:
+        conn = _conn()
         active = db.has_active_job(conn)
         if active is not None:
             raise HTTPException(
@@ -89,8 +129,8 @@ def create_job(req: CreateJobRequest) -> JobResponse:
             )
 
         state = db.get_state(conn)
-        if req.start is not None:
-            start = sync._normalize_iso(req.start)
+        if start_override is not None:
+            start = start_override
         elif state["completed_at"]:
             # Incremental: begin at the last completed time. Intervals are
             # closed on both sides, so the boundary event is re-fetched and
@@ -107,11 +147,45 @@ def create_job(req: CreateJobRequest) -> JobResponse:
         conn.commit()
         row = db.get_job(conn, job_id)
         response = _job_response(conn, row)
-    finally:
-        conn.close()
 
-    if not sync.start_background(job_id, DB_PATH):
-        raise HTTPException(status_code=409, detail="a sync worker is already running")
+        # Hand the already-held claim to the worker thread. The claim is
+        # transferred, not re-acquired, so there is no window in which another
+        # request could slip in between "job accepted" and "worker started".
+        start_attempted = True
+        try:
+            started = sync.start_background(
+                job_id, DB_PATH, allowed_statuses=("collecting",), claim_held=True
+            )
+        except Exception:
+            # start_background released the claim before re-raising.
+            started = False
+    finally:
+        if conn is not None:
+            conn.close()
+        if not start_attempted:
+            if job_id is not None:
+                # The row is committed but still under our claim; make it
+                # explicitly resumable instead of an unexecuted 'collecting'
+                # row that would block every future sync. Never mask an
+                # exception already propagating out of the try block.
+                try:
+                    _mark_unstarted_failed(
+                        job_id, "worker could not be prepared; resume this job"
+                    )
+                except Exception:
+                    pass
+            sync.release_claim()
+
+    if not started:
+        # Defensive: the row exists but no worker owns it. Make it explicitly
+        # resumable instead of leaving it stuck in 'collecting', which would
+        # block every future job.
+        _mark_unstarted_failed(job_id, "worker could not be started; resume this job")
+        raise HTTPException(
+            status_code=503,
+            detail=f"job {job_id} was created but its worker could not start; "
+                   f"resume it via POST /sync/jobs/{job_id}/resume",
+        )
     return response
 
 
@@ -138,8 +212,19 @@ def get_job(job_id: int) -> JobResponse:
 
 @app.post("/sync/jobs/{job_id}/resume", response_model=JobResponse)
 def resume_job(job_id: int) -> JobResponse:
-    conn = _conn()
+    # Claim before reading: a losing resume must not report success nor alter
+    # the job it no longer owns. The winner hands the claim to the worker.
+    if not sync.try_claim():
+        raise HTTPException(
+            status_code=409,
+            detail="another synchronization is in progress in this API process; "
+                   "retry after it finishes",
+        )
+
+    start_attempted = False
+    conn = None
     try:
+        conn = _conn()
         row = db.get_job(conn, job_id)
         if row is None:
             raise HTTPException(status_code=404, detail="job not found")
@@ -149,13 +234,33 @@ def resume_job(job_id: int) -> JobResponse:
                 detail=f"job is {row['status']}; only failed/interrupted jobs can resume",
             )
         response = _job_response(conn, row)
-    finally:
-        conn.close()
 
-    # Same original closed interval is reused; the durable cursor determines
-    # where fetching continues (or re-starts from offset 0 after cursor expiry).
-    if not sync.start_background(job_id, DB_PATH):
-        raise HTTPException(status_code=409, detail="a sync worker is already running")
+        # Same original closed interval is reused; the durable cursor
+        # determines where fetching continues (or re-starts from offset 0
+        # after cursor expiry). The status is re-checked under the held claim,
+        # so a job that meanwhile completed/moved on is not resurrected.
+        start_attempted = True
+        try:
+            started = sync.start_background(
+                job_id, DB_PATH,
+                allowed_statuses=("failed", "interrupted"),
+                claim_held=True,
+            )
+        except Exception:
+            # start_background released the claim before re-raising.
+            started = False
+    finally:
+        if conn is not None:
+            conn.close()
+        if not start_attempted:
+            sync.release_claim()
+
+    if not started:
+        raise HTTPException(
+            status_code=409,
+            detail="job changed state before it could be resumed; re-check "
+                   "GET /sync/jobs/{id} and retry if it is failed/interrupted",
+        )
     return response
 
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# End-to-end demo: full sync, disconnect/resume, cursor expiry, incremental
-# sync, retraction stickiness, and collector restart resumption.
+# End-to-end demo: full sync, slow-page responsiveness, concurrent submissions
+# (409 without orphans), disconnect/resume, cursor expiry, incremental sync,
+# retraction stickiness, and collector restart resumption.
 #
 # Usage:
 #   docker compose up -d --build
 #   ./demo/demo.sh
 set -euo pipefail
 
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SOURCE=${SOURCE_URL:-http://localhost:8000}
 COLLECTOR=${COLLECTOR_URL:-http://localhost:8001}
 CUTOFF_1="2026-11-08T23:59:59Z"
@@ -24,25 +26,82 @@ wait_for() {
   echo "timeout waiting for $url" >&2
   exit 1
 }
+job_status() { req "$COLLECTOR/sync/jobs/$1" | jq -r .status; }
+job_count()  { req "$COLLECTOR/sync/jobs" | jq 'length'; }
+wait_status() {
+  # wait_status <job_id> <expected_status...>
+  local id=$1; shift
+  local status
+  for _ in $(seq 1 60); do
+    status=$(job_status "$id")
+    for want in "$@"; do
+      [ "$status" = "$want" ] && return 0
+    done
+    sleep 1
+  done
+  return 1
+}
 
 wait_for "$SOURCE/health"
 wait_for "$COLLECTOR/health"
 
 hr "0. Reset demo state"
 req -X POST "$SOURCE/control/reset" | jq .
+req -X POST "$SOURCE/control/page-delay" -H 'Content-Type: application/json' \
+  -d '{"seconds":0}' >/dev/null
 req "$SOURCE/control/state" | jq .
 
 # ---------------------------------------------------------------------------
 hr "1. First full sync (closed interval, paged, shuffled/duplicated events)"
 # ---------------------------------------------------------------------------
+say "Slow the source down: 3s per page, so status/paper queries can be observed mid-fetch"
+req -X POST "$SOURCE/control/page-delay" -H 'Content-Type: application/json' \
+  -d '{"seconds":3}' | jq .
+
 JOB=$(req -X POST "$COLLECTOR/sync/jobs" \
         -H 'Content-Type: application/json' \
         -d "{\"end\": \"$CUTOFF_1\"}" | jq .)
 echo "$JOB" | jq '{id, interval_start, interval_end, status}'
 JOB_ID=$(echo "$JOB" | jq -r .id)
 
+sleep 1
+say "While a slow page is being fetched: status and paper queries stay responsive"
+curl -s -o /dev/null -w "  GET /sync/jobs/$JOB_ID -> HTTP %{http_code} in %{time_total}s\n" \
+  "$COLLECTOR/sync/jobs/$JOB_ID"
+curl -s -o /dev/null -w "  GET /papers             -> HTTP %{http_code} in %{time_total}s\n" \
+  "$COLLECTOR/papers"
+curl -s -o /dev/null -w "  GET /papers-count       -> HTTP %{http_code} in %{time_total}s\n" \
+  "$COLLECTOR/papers-count"
+
+say "Concurrent submissions while one job owns the execution slot"
+BEFORE=$(job_count)
+rm -f /tmp/conflict-*.json
+for i in 1 2 3; do
+  curl -sS -o "/tmp/conflict-$i.json" -w "%{http_code}\n" \
+    -X POST "$COLLECTOR/sync/jobs" -H 'Content-Type: application/json' \
+    -d "{\"end\": \"$CUTOFF_2\"}" >"/tmp/conflict-$i.code" &
+done
+wait
+CODES=""
+for i in 1 2 3; do CODES="$CODES $(cat "/tmp/conflict-$i.code")"; done
+echo "  HTTP codes:$CODES"
+cat /tmp/conflict-1.json | jq -r '"  rejected body: " + .detail' 2>/dev/null || true
+AFTER=$(job_count)
+JOBS_NOW=$(req "$COLLECTOR/sync/jobs")
+echo "  jobs before=$BEFORE after=$AFTER (must be equal: 409 adds NO job row)"
+if [ "$BEFORE" -ne "$AFTER" ]; then
+  echo "FAIL: a rejected request created an orphan job" >&2
+  echo "$JOBS_NOW" | jq . >&2
+  exit 1
+fi
+echo "$JOBS_NOW" | jq -r '.[] | "  job \(.id): \(.status)"'
+if echo "$JOBS_NOW" | jq -e '.[] | select(.status=="collecting")' >/dev/null; then
+  echo "  (the one legitimate in-flight job is still collecting; rejected ones added no row)"
+fi
+rm -f /tmp/conflict-*.json /tmp/conflict-*.code
+
 say "Polling job $JOB_ID until completed"
-for _ in $(seq 1 30); do
+for _ in $(seq 1 40); do
   JOB=$(req "$COLLECTOR/sync/jobs/$JOB_ID")
   STATUS=$(echo "$JOB" | jq -r .status)
   echo "  status=$STATUS pages=$(echo "$JOB" | jq -r .pages_fetched) staged=$(echo "$JOB" | jq -r .staged_count)"
@@ -51,6 +110,30 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 echo "$JOB" | jq '{id, status, pages_fetched, staged_count, cursor_resets}'
+req -X POST "$SOURCE/control/page-delay" -H 'Content-Type: application/json' \
+  -d '{"seconds":0}' >/dev/null
+
+say "Immediately after completion: competition may 409 (slot hand-off), but retry is accepted"
+COUNT_BEFORE=$(job_count)
+RESUBMIT_ID=""
+for attempt in $(seq 1 20); do
+  CODE=$(curl -sS -o /tmp/resubmit.json -w '%{http_code}' \
+    -X POST "$COLLECTOR/sync/jobs" -H 'Content-Type: application/json' \
+    -d "{\"end\": \"$CUTOFF_1\"}")
+  if [ "$CODE" = "201" ]; then
+    RESUBMIT_ID=$(jq -r .id /tmp/resubmit.json)
+    echo "  attempt $attempt: HTTP 201 -> job $RESUBMIT_ID accepted"
+    break
+  fi
+  echo "  attempt $attempt: HTTP $CODE ($(jq -r .detail /tmp/resubmit.json))"
+  [ "$(job_count)" -eq "$COUNT_BEFORE" ] \
+    || { echo "FAIL: a rejected submit added a job row" >&2; exit 1; }
+  sleep 0.3
+done
+[ -n "$RESUBMIT_ID" ] || { echo "submit never accepted" >&2; exit 1; }
+wait_status "$RESUBMIT_ID" completed || { echo "resubmit did not complete" >&2; exit 1; }
+echo "  job $RESUBMIT_ID completed; jobs=$(job_count)"
+rm -f /tmp/resubmit.json
 
 say "Completed time is now recorded (incremental baseline)"
 req "$COLLECTOR/sync/state" | jq .
@@ -169,40 +252,52 @@ for p in P0008 P0010 P0011 P0012; do
 done
 
 # ---------------------------------------------------------------------------
-hr "4. Restart resilience: kill the collector mid-job, then resume"
+hr "4. Restart resilience: kill the collector WHILE a job is collecting"
 # ---------------------------------------------------------------------------
-say "Append an event, then make the next /changes call fail so the job stays open"
+say "Append an event and make each page take 5s, so the job is still collecting"
 req -X POST "$SOURCE/control/append" -H 'Content-Type: application/json' \
   -d '{"events":[{"paper_id":"P0009","rev":1,"title":"Federated Search Latency Budgets",
                   "authors":"N. Ahmed","is_retracted":0,"changed_at":"2026-11-12T09:00:00Z"}]}' >/dev/null
-req -X POST "$SOURCE/control/fail" -H 'Content-Type: application/json' -d '{"times":1}' >/dev/null
+req -X POST "$SOURCE/control/page-delay" -H 'Content-Type: application/json' \
+  -d '{"seconds":5}' >/dev/null
 
-req -X POST "$COLLECTOR/sync/jobs" -H 'Content-Type: application/json' \
-  -d '{"end":"2026-11-12T23:59:59Z"}' | jq '{id, status, interval_end}'
-for _ in $(seq 1 20); do
-  ST=$(req "$COLLECTOR/sync/jobs" | jq -r '.[0].status')
-  [ "$ST" != "collecting" ] && [ "$ST" != "committing" ] && break
-  sleep 0.5
-done
+JOB4=$(req -X POST "$COLLECTOR/sync/jobs" -H 'Content-Type: application/json' \
+         -d '{"end":"2026-11-12T23:59:59Z"}')
+LATEST=$(echo "$JOB4" | jq -r .id)
+ORIGINAL_START=$(echo "$JOB4" | jq -r .interval_start)
+ORIGINAL_END=$(echo "$JOB4" | jq -r .interval_end)
+echo "$JOB4" | jq '{id, status, interval_start, interval_end}'
+
+# Wait until the worker has actually begun collecting (status flips promptly;
+# the page itself is still in flight for ~2s).
+sleep 1
+BEFORE_RESTART=$(req "$COLLECTOR/sync/jobs/$LATEST" | jq '{status, pages_fetched}')
+echo "  before restart: $BEFORE_RESTART"
 
 say "Restarting the collector container (SQLite lives on a named volume)"
-docker compose restart collector >/dev/null
+(cd "$REPO_ROOT" && docker compose restart collector >/dev/null)
 wait_for "$COLLECTOR/health"
 
-say "After restart the open job is resumable (failed/interrupted)"
-req "$COLLECTOR/sync/jobs" | jq -r '.[0] | "  job \(.id): status=\(.status) pages=\(.pages_fetched) resets=\(.cursor_resets)"'
-LATEST=$(req "$COLLECTOR/sync/jobs" | jq -r '.[0].id')
+say "After restart the in-flight job is explicitly interrupted, same id/interval"
+RESTARTED=$(req "$COLLECTOR/sync/jobs/$LATEST")
+echo "$RESTARTED" | jq '{id, status, error, interval_start, interval_end, pages_fetched}'
+[ "$(echo "$RESTARTED" | jq -r .status)" = "interrupted" ] \
+  || { echo "expected interrupted after restart" >&2; exit 1; }
+[ "$(echo "$RESTARTED" | jq -r .interval_start)" = "$ORIGINAL_START" ] \
+  && [ "$(echo "$RESTARTED" | jq -r .interval_end)" = "$ORIGINAL_END" ] \
+  || { echo "interval changed across restart" >&2; exit 1; }
+echo "  OK: job $LATEST is resumable with [start,end] unchanged"
 
-say "Clear the fault and resume (same closed interval, durable checkpoint)"
-req -X POST "$SOURCE/control/fail" -H 'Content-Type: application/json' -d '{"times":0}' >/dev/null
+say "Clear the slow page and resume by the SAME job id"
+req -X POST "$SOURCE/control/page-delay" -H 'Content-Type: application/json' \
+  -d '{"seconds":0}' >/dev/null
 req -X POST "$COLLECTOR/sync/jobs/$LATEST/resume" >/dev/null
-for _ in $(seq 1 30); do
-  JOB4=$(req "$COLLECTOR/sync/jobs/$LATEST")
-  STATUS=$(echo "$JOB4" | jq -r .status)
-  echo "  status=$STATUS pages=$(echo "$JOB4" | jq -r .pages_fetched)"
-  [ "$STATUS" = "completed" ] && break
-  sleep 1
-done
+wait_status "$LATEST" completed failed || true
+JOB4=$(req "$COLLECTOR/sync/jobs/$LATEST")
+echo "$JOB4" | jq '{id, status, pages_fetched, interval_start, interval_end}'
+[ "$(echo "$JOB4" | jq -r .status)" = "completed" ] \
+  || { echo "resume after restart did not complete" >&2; exit 1; }
+req "$COLLECTOR/papers/P0009" | jq -r '"  P0009 published: rev=\(.rev) \(.title)"'
 
 # ---------------------------------------------------------------------------
 hr "5. Final library state"
